@@ -1,0 +1,5 @@
+work/
+out/
+*.p12
+*.cer
+.DS_Store

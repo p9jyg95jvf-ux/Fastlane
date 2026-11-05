@@ -1,0 +1,134 @@
+# IPA neu signieren - ohne Xcode-Projekt, ohne Apple-Login, ohne Quellcode-Build.
+# Eingaben kommen aus dem Workflow (scripts/fetch_inputs.sh):
+#   RESIGN_WORK   Arbeitsordner mit input.ipa, profiles/*.mobileprovision, cert.p12
+#   OUT_IPA       Zielpfad der signierten IPA
+#   P12_PASSWORD  Passwort der .p12
+#   KEYCHAIN_PASSWORD  Passwort fuer die temporaere Keychain
+#   BUNDLE_ID / DISPLAY_NAME / APP_VERSION  optional
+
+require "plist"
+require "digest"
+require "fileutils"
+require "tmpdir"
+
+default_platform(:ios)
+
+KEYCHAIN_NAME = "resign-tool"
+
+def env!(name)
+  value = ENV[name].to_s.strip
+  UI.user_error!("Umgebungsvariable #{name} fehlt") if value.empty?
+  value
+end
+
+def env_opt(name)
+  value = ENV[name].to_s.strip
+  value.empty? ? nil : value
+end
+
+def read_profile(path)
+  xml = IO.popen(["security", "cms", "-D", "-i", path], err: File::NULL, &:read)
+  UI.user_error!("Provisioning Profile nicht lesbar: #{path}") if xml.to_s.empty?
+  Plist.parse_xml(xml)
+end
+
+def profile_bundle_id(info)
+  app_id = info.dig("Entitlements", "application-identifier").to_s
+  prefix = (info["ApplicationIdentifierPrefix"] || info["TeamIdentifier"] || []).first.to_s
+  app_id.sub(/\A#{Regexp.escape(prefix)}\./, "")
+end
+
+def profile_cert_fingerprints(info)
+  (info["DeveloperCertificates"] || []).map do |cert|
+    der = cert.respond_to?(:read) ? cert.read : cert.to_s
+    Digest::SHA1.hexdigest(der).upcase
+  end
+end
+
+lane :resign_ipa do
+  work = File.expand_path(env!("RESIGN_WORK"))
+  out_ipa = File.expand_path(env!("OUT_IPA"))
+  source_ipa = File.join(work, "input.ipa")
+  p12 = File.join(work, "cert.p12")
+  keychain_password = env!("KEYCHAIN_PASSWORD")
+
+  profile_paths = Dir[File.join(work, "profiles", "*.mobileprovision")].sort
+  UI.user_error!("Keine .mobileprovision gefunden") if profile_paths.empty?
+  UI.user_error!("input.ipa fehlt") unless File.exist?(source_ipa)
+  UI.user_error!("cert.p12 fehlt") unless File.exist?(p12)
+
+  # --- Profile pruefen -------------------------------------------------
+  profiles = profile_paths.map { |path| [path, read_profile(path)] }
+  profiles.each do |path, info|
+    expires = info["ExpirationDate"]
+    UI.user_error!("Profil '#{info['Name']}' ist abgelaufen (#{expires})") if expires && expires.to_time < Time.now
+    UI.message("Profil: #{info['Name']} | #{info.dig('Entitlements', 'application-identifier')} | gueltig bis #{expires}")
+  end
+
+  # --- Zertifikat in temporaere Keychain importieren --------------------
+  create_keychain(
+    name: KEYCHAIN_NAME,
+    password: keychain_password,
+    default_keychain: true,
+    unlock: true,
+    timeout: 3600,
+    lock_when_sleeps: false,
+    require_create: false
+  )
+  import_certificate(
+    certificate_path: p12,
+    certificate_password: ENV["P12_PASSWORD"].to_s,
+    keychain_name: KEYCHAIN_NAME,
+    keychain_password: keychain_password
+  )
+
+  # --- Identitaet waehlen, die zum Profil passt --------------------------
+  wanted = profile_cert_fingerprints(profiles.first[1])
+  listing = `security find-identity -p codesigning`
+  identities = listing.scan(/^\s*\d+\)\s+([0-9A-F]{40})\s+"(.+)"/)
+  UI.message("Gefundene Identitaeten: #{identities.map(&:last).join(', ')}")
+  match = identities.find { |hash, _| wanted.include?(hash) }
+  UI.user_error!(
+    "Das Zertifikat in der .p12 ist nicht im Provisioning Profile enthalten. " \
+    "Profil und Zertifikat muessen zusammengehoeren."
+  ) if match.nil?
+  identity = match[1]
+  UI.success("Signiere mit: #{identity}")
+
+  # --- Resign --------------------------------------------------------------
+  FileUtils.mkdir_p(File.dirname(out_ipa))
+  FileUtils.cp(source_ipa, out_ipa)
+
+  provisioning =
+    if profiles.size == 1
+      profiles.first[0]
+    else
+      profiles.each_with_object({}) { |(path, info), h| h[profile_bundle_id(info)] = path }
+    end
+
+  bundle_id = env_opt("BUNDLE_ID")
+  if bundle_id.nil? && profiles.size == 1
+    from_profile = profile_bundle_id(profiles.first[1])
+    bundle_id = from_profile unless from_profile.include?("*")
+  end
+
+  options = {
+    ipa: out_ipa,
+    signing_identity: identity,
+    provisioning_profile: provisioning
+  }
+  options[:bundle_id] = bundle_id if bundle_id
+  options[:display_name] = env_opt("DISPLAY_NAME") if env_opt("DISPLAY_NAME")
+  options[:version] = env_opt("APP_VERSION") if env_opt("APP_VERSION")
+  resign(**options)
+
+  # --- Pruefen -------------------------------------------------------------
+  Dir.mktmpdir do |dir|
+    sh("unzip", "-q", out_ipa, "-d", dir)
+    app = Dir[File.join(dir, "Payload", "*.app")].first
+    UI.user_error!("Keine .app in der signierten IPA") if app.nil?
+    sh("codesign", "--verify", "--deep", "--strict", "--verbose=2", app)
+    sh("codesign", "-dv", app)
+  end
+  UI.success("Fertig: #{out_ipa}")
+end
